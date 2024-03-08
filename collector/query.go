@@ -68,4 +68,15 @@ const (
 	FROM ACCOUNT_USAGE.REPLICATION_USAGE_HISTORY
 	WHERE START_TIME >= dateadd(hour, -24, current_timestamp())
 	GROUP BY DATABASE_NAME, DATABASE_ID;`
+
+	queryMetricQuery = `SELECT QUERY_ID, QUERY_TEXT, TOTAL_ELAPSED_TIME, BYTES_SCANNED, ROWS_PRODUCED, BYTES_WRITTEN, QUERY_TYPE
+	FROM ACCOUNT_USAGE.QUERY_HISTORY
+	WHERE START_TIME >= dateadd(hour, -24, current_timestamp()) AND QUERY_TEXT != '<redacted>';`
+
+	userQueryMetricQuery = `SELECT USER_NAME, count(1) FROM ACCOUNT_USAGE.QUERY_HISTORY
+	WHERE START_TIME >= dateadd(hour, -24, current_timestamp())
+	GROUP BY USER_NAME;`
+
+	queryCountMetricQuery = `SELECT count(1) FROM ACCOUNT_USAGE.QUERY_HISTORY
+	WHERE START_TIME >= dateadd(hour, -24, current_timestamp());`
 )

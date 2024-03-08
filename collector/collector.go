@@ -40,6 +40,10 @@ const (
 	labelSchemaName    = "schema_name"
 	labelSchemaID      = "schema_id"
 	labelSize          = "size"
+	labelQueryID       = "query_id"
+	labelQueryText     = "query_text"
+	labelQueryType     = "query_type"
+	labelUserName      = "user_name"
 )
 
 // openSnowflakeDatabase opens a connection to a Snowflake database using the given connection string.
@@ -79,6 +83,11 @@ type Collector struct {
 	tableCloneBytes                   *prometheus.Desc
 	replicationUsedCredits            *prometheus.Desc
 	replicationTransferredBytes       *prometheus.Desc
+	queryElapsedTime                  *prometheus.Desc
+	queryBytes                        *prometheus.Desc
+	queryRows                         *prometheus.Desc
+	userQueries                       *prometheus.Desc
+	queries                           *prometheus.Desc
 	up                                *prometheus.Desc
 }
 
@@ -239,6 +248,36 @@ func NewCollector(logger log.Logger, c *Config) *Collector {
 			[]string{labelDatabaseName, labelDatabaseID},
 			nil,
 		),
+		queryElapsedTime: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, "query", "elapsed_time"),
+			"Metric indicating the amount of time in milliseconds a query took to execute",
+			[]string{labelQueryID, labelQueryText},
+			nil,
+		),
+		queryBytes: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, "query", "bytes"),
+			"Metric indicating the amount of bytes processed by the query",
+			[]string{labelQueryID, labelQueryText, labelQueryType},
+			nil,
+		),
+		queryRows: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, "query", "rows"),
+			"Metric indicating the number of rows",
+			[]string{labelQueryID, labelQueryText, labelQueryType},
+			nil,
+		),
+		userQueries: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, "users", "queries"),
+			"Metric indicating the number of queries executed by each user",
+			[]string{labelUserName},
+			nil,
+		),
+		queries: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, "query", "count"),
+			"Metric indicating the number of queries",
+			nil,
+			nil,
+		),
 		up: prometheus.NewDesc(
 			prometheus.BuildFQName(namespace, "", "up"),
 			"Metric indicating the status of the exporter collection. 1 indicates that the connection Snowflake was successful, and all available metrics were collected. "+
@@ -277,6 +316,11 @@ func (c *Collector) Describe(descs chan<- *prometheus.Desc) {
 	descs <- c.tableCloneBytes
 	descs <- c.replicationUsedCredits
 	descs <- c.replicationTransferredBytes
+	descs <- c.queryElapsedTime
+	descs <- c.queryBytes
+	descs <- c.queryRows
+	descs <- c.userQueries
+	descs <- c.queries
 	descs <- c.up
 }
 
@@ -338,6 +382,21 @@ func (c *Collector) Collect(metrics chan<- prometheus.Metric) {
 
 	if err := c.collectReplicationMetrics(db, metrics); err != nil {
 		level.Error(c.logger).Log("msg", "Failed to collect replication metrics.", "err", err)
+		up = 0
+	}
+
+	if err := c.collectQueryMetrics(db, metrics); err != nil {
+		level.Error(c.logger).Log("msg", "Failed to collect query metrics.", "err", err)
+		up = 0
+	}
+
+	if err := c.collectUserQueryMetrics(db, metrics); err != nil {
+		level.Error(c.logger).Log("msg", "Failed to collect user query metrics.", "err", err)
+		up = 0
+	}
+
+	if err := c.collectQueryCountMetrics(db, metrics); err != nil {
+		level.Error(c.logger).Log("msg", "Failed to collect query count metrics.", "err", err)
 		up = 0
 	}
 
@@ -549,6 +608,74 @@ func (c *Collector) collectReplicationMetrics(db *sql.DB, metrics chan<- prometh
 
 		metrics <- prometheus.MustNewConstMetric(c.replicationUsedCredits, prometheus.GaugeValue, creditsUsed, databaseName, databaseID)
 		metrics <- prometheus.MustNewConstMetric(c.replicationTransferredBytes, prometheus.GaugeValue, bytesTransferred, databaseName, databaseID)
+	}
+
+	return rows.Err()
+}
+
+func (c *Collector) collectQueryMetrics(db *sql.DB, metrics chan<- prometheus.Metric) error {
+	rows, err := db.Query(queryMetricQuery)
+	if err != nil {
+		return fmt.Errorf("failed to query metrics: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var queryID, queryText, queryType string
+		var elapsedTime float64
+		var bytesRead, bytesWritten, rowsProduced sql.NullFloat64
+		var rowCount, byteCount float64
+		if err := rows.Scan(&queryID, &queryText, &elapsedTime, &bytesRead, &rowsProduced, &bytesWritten, &queryType); err != nil {
+			return fmt.Errorf("failed to scan row: %w", err)
+		}
+		rowCount = rowsProduced.Float64
+		switch queryType {
+		case "INSERT":
+			byteCount = bytesWritten.Float64
+		case "SELECT":
+			byteCount = bytesRead.Float64
+		}
+		metrics <- prometheus.MustNewConstMetric(c.queryRows, prometheus.GaugeValue, rowCount, queryID, queryText, queryType)
+		metrics <- prometheus.MustNewConstMetric(c.queryBytes, prometheus.GaugeValue, byteCount, queryID, queryText, queryType)
+		metrics <- prometheus.MustNewConstMetric(c.queryElapsedTime, prometheus.GaugeValue, elapsedTime, queryID, queryText)
+	}
+
+	return rows.Err()
+}
+
+func (c *Collector) collectUserQueryMetrics(db *sql.DB, metrics chan<- prometheus.Metric) error {
+	rows, err := db.Query(userQueryMetricQuery)
+	if err != nil {
+		return fmt.Errorf("failed to query metrics: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var username string
+		var queryCount float64
+		if err := rows.Scan(&username, &queryCount); err != nil {
+			return fmt.Errorf("failed to scan row: %w", err)
+		}
+
+		metrics <- prometheus.MustNewConstMetric(c.userQueries, prometheus.GaugeValue, queryCount, username)
+	}
+
+	return rows.Err()
+}
+
+func (c *Collector) collectQueryCountMetrics(db *sql.DB, metrics chan<- prometheus.Metric) error {
+	rows, err := db.Query(queryCountMetricQuery)
+	if err != nil {
+		return fmt.Errorf("failed to query metrics: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var queryCount float64
+		if err := rows.Scan(&queryCount); err != nil {
+			return fmt.Errorf("failed to scan row: %w", err)
+		}
+		metrics <- prometheus.MustNewConstMetric(c.queries, prometheus.GaugeValue, queryCount)
 	}
 
 	return rows.Err()
